@@ -2,7 +2,7 @@
 
 ## Status (update at the end of every phase)
 
-- Current phase: **1 (Generator)**, in progress. Phase 0 done (catalog `procurement` created).
+- Current phase: **2 (Bronze)** in progress: James writing the 3 TODOs in `pipelines/bronze/ingest_bronze.py`. Phases 0 and 1 done; batches 1 to 3 generated in Databricks.
 - Catalog in use: `procurement` (CREATE CATALOG works on Free Edition)
 - Last session: Mon 12 Oct 2026 (one day behind schedule)
 

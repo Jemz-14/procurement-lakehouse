@@ -133,3 +133,23 @@ A Python generator (`generator/procurement_generator.py`, run from the `run_gene
 - `csv.DictWriter` with `newline=""`, and `json.dumps` per row for JSON Lines.
 - `collections.Counter` for counting defects.
 - `pathlib.Path` for file paths, which works the same on Windows locally and on `/Volumes/...` in Databricks.
+
+### Quiz answers to say out loud
+
+**Why seed the generator, and what goes wrong without a seed?**
+The seed makes the input reproducible: the same seed and parameters always produce byte-identical files, which I checked with a file hash. That matters for testing, because when I rerun a batch and the output changes, I know the change came from my pipeline code, not from the data. It also means a bug can be reproduced, and a colleague can regenerate exactly the same dataset. Without a seed, Python seeds itself from the system clock or the OS, so every run produces different data and a failure might never happen twice. I use a dedicated `random.Random` instance seeded per batch, rather than the global `random` module, so nothing else in the process can disturb the sequence.
+
+**Hard defects versus soft defects.**
+A hard defect means the value is wrong or missing and I cannot safely fix it: a negative quantity, a null supplier ID, an unknown supplier, a date like 30 February. Silver sends those rows to `ops.quarantine` with a reject reason. A soft defect means the value is right but formatted inconsistently, like `' active '` instead of `ACTIVE`, or `cc-200` instead of `CC-200`. Silver standardises those with something like `upper(trim(status))` and keeps the row. Where the line sits between the two is a business rule, so it should be written down and agreed. For example, `'1,234.50'` as text could be repaired, but I chose to quarantine it, because guessing at number formats is how wrong amounts reach finance.
+
+**Why JSON Lines rather than one JSON array or CSV?**
+CSV cannot hold the nested PO lines without flattening them into repeated header rows, or splitting them into a separate file. Between the JSON options, JSON Lines puts one complete record per line. Spark can split a large file across many tasks and parse each line on its own, and one corrupt line only affects that record. A single JSON array is one document: Spark needs `multiLine` mode, cannot split the file, so one task reads it all, and one missing bracket breaks the whole file. JSON Lines is also the default for Spark and Auto Loader.
+
+**Why was `amount` a string, and how do I avoid losing `'1,234.50'`?**
+`read_files` infers types by sampling the data. Most amounts were JSON numbers, but a few were JSON strings, so the only type that fits every value is STRING. Because everything fits a string, nothing was rescued. `_rescued_data` holds values that do not match the schema: wrong type, extra columns, or columns that differ only by case. It stores them as JSON together with the source file path. To make sure nothing is lost, I fix the type with a schema hint, `amount DOUBLE`. Then good values are typed correctly, and bad values go to `_rescued_data` instead of silently becoming null. Silver then quarantines those rows.
+
+**Why not `WHERE po_id IS NULL` for the maverick share?**
+`WHERE` filters rows before the aggregation runs, so the total would only include the maverick invoices and I would have nothing to divide by. Instead I used conditional aggregation: `count_if(po_id IS NULL)` and `SUM(CASE WHEN po_id IS NULL THEN amount ELSE 0 END)`, next to `SUM(amount)` over all rows, all in one pass. I also cleaned the amount once in a CTE rather than repeating the cast.
+
+**`dict(po)` versus `copy.deepcopy(po)`.**
+`dict(po)` is a shallow copy: a new outer dictionary, but the `lines` value is still the same list with the same line dictionaries inside. Changing `copy["status"]` is safe, but changing `copy["lines"][0]["quantity"]` also changes the original. `copy.deepcopy` copies everything recursively. In my generator, the state keeps the clean POs, and `inject_problems` corrupts the rows that get written. If those were shallow copies, a negative quantity would leak back into the state and corrupt later batches. So I deep copy before injecting defects. For suppliers I use `dict(supplier)`, which is fine because a supplier record is flat.
