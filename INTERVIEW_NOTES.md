@@ -72,6 +72,64 @@ A GitHub repo synced into Databricks through a Git folder, and a rerunnable SQL 
 - **Managed vs external:** who owns the storage and what `DROP` does (see decision 4).
 - **Volumes:** governed file storage, path `/Volumes/<catalog>/<schema>/<volume>/...`.
 
+### Quiz answers to say out loud
+
+**Which compute for a nightly pipeline and for a Power BI dashboard?**
+The nightly pipeline runs as a Lakeflow Job on job compute, or serverless job compute. The cluster starts for the run and shuts down when it finishes, so I only pay for the run itself. Power BI connects to a SQL warehouse, which is built for many concurrent SQL queries and auto-stops when nobody is querying. I would not use all-purpose compute for either, because it is meant for interactive development, costs more per unit, and keeps billing while it is idle.
+
+**Explain `procurement.gold.mart_spend_monthly`.**
+`procurement` is the catalog, `gold` is the schema, and `mart_spend_monthly` is the table. Above the catalog sits the Unity Catalog metastore, which is the top-level container for one region and can be attached to many workspaces. Volumes live at the same level as tables, so the raw files are in `procurement.landing.raw`, with the path `/Volumes/procurement/landing/raw/`. Permissions are inherited downwards, so a grant on the `gold` schema covers every table in it.
+
+**What does `DROP TABLE` do to a managed table and to an external table?**
+For a managed table, Unity Catalog owns the storage, so dropping it removes the definition and the data files. In Unity Catalog I can still `UNDROP` it for a few days. For an external table, dropping it only removes the definition from the catalog. The files stay in ADLS or S3, and I can recreate the table on the same path. I default to managed, because Databricks can then handle optimization and clean-up for me. I use external only when other tools need to read the files directly, or when the data has to outlive the table.
+
+**Why land raw files in a volume first?**
+First, I keep an untouched copy of exactly what the source sent. If my parsing logic has a bug, or the schema changes, I can fix the code and reprocess from the original files instead of asking the source to resend. Second, it decouples the source from my pipeline: the procurement system just drops files and needs no access to my tables. Third, Auto Loader can then pick up new files incrementally. In production, a P2P platform like Coupa or SAP Ariba would export files to cloud storage owned by the data team. That storage is registered in Unity Catalog as an external location or external volume, or the data comes in through Lakeflow Connect if there is a connector.
+
+**Why does each layer have its own schema, and why a separate `ops` schema?**
+Mainly access control and lifecycle. Permissions in Unity Catalog are inherited, so I can give analysts `SELECT` on `gold` and nothing else, and they never see raw or rejected data. Each layer also has a different owner, different quality guarantees and potentially a different retention policy. `ops` keeps operational data, like quarantined rows, run logs and checkpoints, away from business data, and only engineers get access to it.
+
 ### Honesty check
 
 I built this on **Databricks Free Edition**. I should say that plainly. It means serverless only, no custom storage locations, no account console, so some production features (external locations, real groups from SCIM, job clusters with custom sizes) I can explain but did not configure myself.
+
+---
+
+## Phase 1: Data generator
+
+### What we built
+
+A Python generator (`generator/procurement_generator.py`, run from the `run_generator` notebook) that simulates a procure-to-pay system dropping one extract per batch into the volume: suppliers as CSV, purchase orders as JSON Lines with nested lines, goods receipts as CSV, invoices as JSON Lines. Each batch covers 30 days. It injects realistic problems at a configurable error rate: hard defects to quarantine, soft formatting issues to standardise, duplicates, updated records, late-arriving receipts, maverick invoices, price variances, and a new `contract_id` column from batch 5.
+
+### Decisions, why, and the alternative
+
+**1. The generator simulates a real lifecycle instead of producing random unrelated rows.**
+- Why: each PO gets a plan when it is created: receipt dates per line, short deliveries, an invoice date, or a cancellation. Each batch then emits only the events dated in its window. So receipts and invoices always point at real POs, POs move through APPROVED, PARTIALLY_RECEIVED, RECEIVED and CLOSED, and the gold marts (OTIF, three-way match, payment compliance) have meaningful data to measure.
+- Alternative: random rows per entity. Much simpler, but joins would mostly fail and the KPIs would be noise.
+
+**2. State is saved between batches, and batches run in order.**
+- Why: a real source system remembers what it sent before. Batch 3 needs to know which POs are still open and which receipts are late. The state is a JSON file per batch under `_generator_state/`, and the underscore means Spark and Auto Loader ignore that folder.
+- Alternative: regenerate all previous batches from the seed every time. No state file, but if I change `rows_per_entity` for a later batch, the history would silently change.
+
+**3. Seeded randomness with a dedicated `random.Random` instance per batch.**
+- Why: the same seed and parameters always produce byte-identical files. That makes the pipeline tests repeatable: if I rerun batch 3, I get exactly the same input, so any difference in output is my pipeline, not the data. I tested this by regenerating a batch and comparing file hashes.
+- Alternative: the global `random` module with no seed. Every run is different and bugs are hard to reproduce.
+
+**4. Hard defects versus soft defects.**
+- Why: they need different handling. A negative quantity or an unknown supplier ID is wrong, so silver quarantines the row with a reason. `' active '` versus `ACTIVE` is the right value in the wrong format, so silver standardises it. Rejecting those would throw away good data. This is the difference between validation and standardisation.
+- Alternative: treat every problem as an error. Simpler rules, but you lose valid rows and the quarantine fills with noise.
+
+**5. JSON Lines for nested entities, CSV for flat ones.**
+- Why: POs have a header with an array of lines, which CSV cannot hold without flattening. JSON Lines puts one object per line, so a file can be split and read in parallel, and it is Auto Loader's default JSON mode. CSV is typical for flat master data extracts like suppliers.
+- Alternative: one big JSON array per file. That needs `multiLine` mode and cannot be split across tasks.
+
+**6. Initial supplier versions are dated before the first batch, and new suppliers the day before their window.**
+- Why: in phase 4 the PO fact joins to the supplier version valid on the order date. If a supplier's first version started after its first PO, that join would find nothing.
+
+### Python concepts I should be able to explain
+
+- `random.Random(seed)` creates an independent generator; using it everywhere instead of the global `random` keeps runs reproducible.
+- `copy.deepcopy` versus `dict(...)`: a shallow copy shares the nested `lines` list, so corrupting a copy would also corrupt the saved state.
+- `csv.DictWriter` with `newline=""`, and `json.dumps` per row for JSON Lines.
+- `collections.Counter` for counting defects.
+- `pathlib.Path` for file paths, which works the same on Windows locally and on `/Volumes/...` in Databricks.

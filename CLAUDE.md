@@ -2,9 +2,9 @@
 
 ## Status (update at the end of every phase)
 
-- Current phase: **0 (Setup)**, in progress
-- Catalog in use: `procurement` (fall back to `workspace` if Free Edition refuses `CREATE CATALOG`)
-- Last session: Sun 11 Oct 2026
+- Current phase: **1 (Generator)**, in progress. Phase 0 done (catalog `procurement` created).
+- Catalog in use: `procurement` (CREATE CATALOG works on Free Edition)
+- Last session: Mon 12 Oct 2026 (one day behind schedule)
 
 ## Context (read this first)
 
