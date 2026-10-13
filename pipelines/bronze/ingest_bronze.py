@@ -37,11 +37,16 @@ ENTITIES = {
 from pyspark.sql import functions as F
 
 
+def row_count(table: str) -> int:
+    return spark.table(table).count() if spark.catalog.tableExists(table) else 0
+
 def ingest_entity(entity: str, file_format: str, reader_options: dict) -> int:
+    
     """Load new files for one entity into its bronze table. Returns the number of rows loaded."""
     source_path = f"{landing_root}/{entity}/"
     checkpoint_path = f"{checkpoint_root}/{entity}"
     target_table = f"{catalog}.bronze.{entity}"
+    rows_before = row_count(target_table)
 
     # TODO 1: streaming read with Auto Loader.
     #   spark.readStream.format("cloudFiles")
@@ -88,7 +93,7 @@ def ingest_entity(entity: str, file_format: str, reader_options: dict) -> int:
     )
 
     query.awaitTermination()
-    return sum(progress.get("numInputRows") or 0 for progress in query.recentProgress)
+    return row_count(target_table) - rows_before
 
 # COMMAND ----------
 

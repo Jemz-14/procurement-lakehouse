@@ -16,7 +16,7 @@
 # COMMAND ----------
 
 dbutils.widgets.text("catalog", "procurement")
-dbutils.widgets.text("batch_number", "1")
+dbutils.widgets.text("batch_number", "4")
 dbutils.widgets.text("start_date", "2026-01-01")
 dbutils.widgets.text("rows_per_entity", "200")
 dbutils.widgets.text("error_rate", "0.05")
@@ -55,6 +55,6 @@ print(json.dumps(summary, indent=2))
 
 # COMMAND ----------
 
-for batch_number in [1, 2, 3]:
-    summary = procurement_generator.generate_batch(batch_number, **params)
-    print(batch_number, {e: summary[e]["rows_written"] for e in procurement_generator.ENTITIES})
+#for batch_number in [1, 2, 3]:
+ #   summary = procurement_generator.generate_batch(batch_number, **params)
+  #  print(batch_number, {e: summary[e]["rows_written"] for e in procurement_generator.ENTITIES})
