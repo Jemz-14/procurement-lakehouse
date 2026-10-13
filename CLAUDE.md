@@ -2,9 +2,9 @@
 
 ## Status (update at the end of every phase)
 
-- Current phase: **2 (Bronze)** in progress: James writing the 3 TODOs in `pipelines/bronze/ingest_bronze.py`. Phases 0 and 1 done; batches 1 to 3 generated in Databricks.
+- Current phase: **3 (Silver)**, first half: James writing TODOs 1 to 8 in `pipelines/silver/silver_transactions.py` (dedup, MERGE, explode). Second half (Fri 16): SCD Type 2 `dim_supplier`, batch 5 schema evolution test. Phases 0 to 2 done; batches 1 to 4 in bronze.
 - Catalog in use: `procurement` (CREATE CATALOG works on Free Edition)
-- Last session: Mon 12 Oct 2026 (one day behind schedule)
+- Last session: Tue 13 Oct 2026 (about half a day behind schedule)
 
 ## Context (read this first)
 

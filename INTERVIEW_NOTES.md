@@ -153,3 +153,65 @@ CSV cannot hold the nested PO lines without flattening them into repeated header
 
 **`dict(po)` versus `copy.deepcopy(po)`.**
 `dict(po)` is a shallow copy: a new outer dictionary, but the `lines` value is still the same list with the same line dictionaries inside. Changing `copy["status"]` is safe, but changing `copy["lines"][0]["quantity"]` also changes the original. `copy.deepcopy` copies everything recursively. In my generator, the state keeps the clean POs, and `inject_problems` corrupts the rows that get written. If those were shallow copies, a negative quantity would leak back into the state and corrupt later batches. So I deep copy before injecting defects. For suppliers I use `dict(supplier)`, which is fine because a supplier record is flat.
+
+---
+
+## Phase 2: Bronze with Auto Loader
+
+### What we built
+
+One append-only Delta table per entity in `procurement.bronze`, loaded by Auto Loader from the landing volume with `trigger(availableNow=True)`. Each entity has its own checkpoint in `/Volumes/procurement/ops/checkpoints/bronze/<entity>`, which also stores the inferred schema. Every row gets `_ingested_at`, `_source_file` (from the hidden `_metadata` column) and `_batch` (parsed from the `batch=<n>` folder name), plus Auto Loader's `_rescued_data`. All source columns stay as strings.
+
+What I proved: after loading batches 1 to 3, I generated batch 4 and reran. Only the batch 4 files were processed, `DESCRIBE HISTORY` showed one new commit with exactly the batch 4 row count, and `VERSION AS OF` the previous version still returned the old count. A rerun with no new files loaded nothing. Earlier runs that crashed after the write had committed did not duplicate anything either, because the checkpoint had already recorded those files.
+
+### Decisions, why, and the alternative
+
+**1. Auto Loader rather than a plain batch read or a watermark.**
+- Why: Auto Loader tracks which files it has processed in the checkpoint, so each file is loaded exactly once, and I do not maintain any watermark table myself. My ADF pipelines selected rows by value, `updated_at` greater than the last watermark. Tracking files instead of values means a late-arriving file is still picked up even if its dates are old, like my late goods receipts.
+- Alternative: `COPY INTO`, a SQL command that is also idempotent and skips files it has loaded before. It is fine for simple, smaller loads, but Auto Loader scales better to many files and handles schema inference and evolution. A plain `spark.read` of the folder would reload everything every time.
+
+**2. `trigger(availableNow=True)` instead of a continuously running stream.**
+- Why: the source drops extracts on a schedule, not every second, so a cluster running 24/7 would mostly sit idle and cost money. `availableNow` processes everything new and then stops, so I get batch-job cost with streaming's exactly-once file tracking. It is also what serverless supports: continuous and `processingTime` triggers are not allowed there.
+- Alternative: a continuous stream with a `processingTime` trigger on classic compute, for near real-time data. You pay for the cluster all the time.
+
+**3. Bronze keeps every column as a string.**
+- Why: bronze's job is to store exactly what was delivered and never reject or lose anything. If bronze typed `quantity` as an integer, a bad value would become null plus a JSON blob in `_rescued_data`, and bad-data handling would be split across two layers. With strings, every value lands as sent, and silver does all the typing in one place with `try_cast`, quarantining failures with a clear reason. This is Auto Loader's default for CSV and JSON.
+- Alternative: typed bronze with `cloudFiles.inferColumnTypes` and schema hints. You catch type problems earlier and store less, but the type rules live in two places.
+
+**4. One checkpoint per entity, in a governed volume in `ops`, and reset together with the table.**
+- Why: each stream needs its own checkpoint. Keeping them in a Unity Catalog volume means they are governed and visible, and engineers can inspect them with `cloud_files_state()`. The table and the checkpoint are a pair: delete only the checkpoint and every file is reloaded, creating duplicates; drop only the table and the checkpoint still thinks every file is done, so the table stays empty.
+
+**5. Metadata columns, with `_batch` parsed from the file path.**
+- Why: `_source_file` tells me exactly which file a bad row came from, `_ingested_at` tells me when it arrived, and `_batch` lets me count and reconcile per delivery. Silver will also use them to pick the latest copy when duplicates arrive. I parse `_batch` explicitly from the path with a regex rather than rely on Auto Loader's inferred partition column, then drop that inferred `batch` column so there is only one.
+
+**6. Schema evolution: `mergeSchema` on the write, default `addNewColumns` mode on the read.**
+- Why: when batch 5 adds `contract_id`, Auto Loader notices the new column, updates the saved schema, and stops the stream once with an `UnknownFieldException`. The next run picks up the new schema, and `mergeSchema` lets the Delta table gain the column. In production a job retry handles that restart automatically.
+- Alternative: `rescue` mode never fails and puts new columns into `_rescued_data`. More stable, but a new column can go unnoticed, which is worse for a data contract.
+
+**7. Counting loaded rows from the table, not from stream progress.**
+- Why: on serverless, the streaming progress metric `numInputRows` came back empty, so my counter printed 0 even when rows had loaded. I stopped trusting it and count the table before and after the load instead, which is valid because bronze is append-only. For tables updated by MERGE, I would read the operation metrics in `DESCRIBE HISTORY` instead.
+
+### Delta concepts I should be able to explain
+
+- A Delta table is Parquet data files plus a `_delta_log` folder of numbered JSON commit files. The log is the source of truth for which files make up each version.
+- ACID: a write either commits fully or not at all, readers only ever see committed versions, and concurrent writers are checked against each other (optimistic concurrency), so one fails instead of corrupting the table.
+- `DESCRIBE HISTORY` lists every version with the operation and metrics like `numOutputRows`.
+- Time travel: `VERSION AS OF n` or `TIMESTAMP AS OF '...'` reads an old version. It only works while the old data files still exist, so `VACUUM` (default retention 7 days) limits how far back you can go.
+- `DESCRIBE DETAIL` shows the storage location, number of files and size.
+
+### Quiz answers to say out loud
+
+**How does Auto Loader know what is new, compared with an ADF watermark?**
+A watermark stores one value, such as the highest `updated_at` loaded so far, and the next run asks the source for anything greater than that value. Auto Loader tracks files instead of values. Its checkpoint keeps a record of every file it has already processed, and each run loads only files that are not in that record. The difference shows with late data. If a file arrives today containing goods receipts dated last week, those dates are older than the watermark, so a watermark load skips them. Auto Loader still loads the file, because it is a file it has not seen before.
+
+**What is in the checkpoint, what happens if one side is deleted, and why did the crashes not cause duplicates?**
+The checkpoint stores the list of files already processed, the progress of each micro-batch, and, because I pointed `schemaLocation` at it, the inferred schema and its history. If the checkpoint is deleted but the table is kept, the data in the table is safe, but the stream forgets what it has read, so the next run reloads every file and creates duplicates. If the table is dropped but the checkpoint is kept, the stream still thinks every file is done, so the recreated table stays empty apart from new files. The two must always be reset together. My crashes did not create duplicates because the crash happened after the write had finished. Each micro-batch is committed to the Delta table and then recorded in the checkpoint, and the Delta sink also remembers which micro-batches it has committed. So even if a run fails between those two steps, the restart skips the batch that was already written. That combination gives exactly-once loading.
+
+**What happens when batch 5 adds `contract_id`?**
+With the default mode, `addNewColumns`, Auto Loader detects the new column, adds it to the schema stored in the `schemaLocation`, and then deliberately stops the stream with an `UnknownFieldException`. That first run fails. On the next run, the stream starts with the updated schema and loads the data, and `mergeSchema` on the write allows the Delta table to add the new column. So `schemaLocation` is where Auto Loader keeps and evolves the source schema, and `mergeSchema` is what allows the target table to change. In production, a job retry handles the restart automatically. In `rescue` mode, the schema never changes and the stream never fails, and the `contract_id` values are stored in `_rescued_data` instead of a new column. That is more stable, but a new column can go unnoticed.
+
+**Why `availableNow`, and why strings in bronze?**
+The source delivers files in batches, not continuously, so a stream running all the time would mostly be paying for idle compute. `availableNow` processes everything new, then stops, so I only pay while there is work, and I still get exactly-once file tracking. It is also the trigger serverless compute supports. Bronze keeps every column as a string because its job is to store exactly what was delivered, without rejecting or changing anything. If bronze applied types, bad values would be turned into nulls at the first step. Keeping strings means all typing and validation happen in one place, in silver, where failed conversions are sent to quarantine with a clear reason.
+
+**What makes a Delta write ACID, how does time travel work, and how did you prove batch 4 loaded once?**
+A Delta table is a set of Parquet files plus a transaction log. A write first adds new data files, then commits by creating the next numbered entry in `_delta_log`. Until that commit exists, readers do not see the new files, so a write is either fully visible or not visible at all. Readers always read one complete version, and if two writers try to commit at the same time, Delta's optimistic concurrency control lets one succeed and makes the other retry or fail, so the table is never corrupted. Time travel reads an older version with `VERSION AS OF` or `TIMESTAMP AS OF`. It is limited by retention: `VACUUM` deletes old data files after seven days by default, and the log itself is kept for 30 days by default. To prove batch 4 loaded exactly once, I checked four things: rows per `_batch` showed batch 4 with exactly the row count the generator wrote and earlier batches unchanged; `DESCRIBE HISTORY` showed one new commit whose `numOutputRows` matched; `VERSION AS OF` the previous version returned the old total; and a further run with no new files added no rows.
