@@ -1,4 +1,8 @@
 # Databricks notebook source
+# /// script
+# [tool.databricks.environment]
+# environment_version = "6"
+# ///
 # MAGIC %md
 # MAGIC # Bronze: ingest raw files with Auto Loader
 # MAGIC
@@ -45,14 +49,29 @@ def ingest_entity(entity: str, file_format: str, reader_options: dict) -> int:
     #   .option("cloudFiles.schemaLocation", ...)   use the checkpoint path
     #   .options(**reader_options)                  header=true for CSV
     #   .load(...)
-    raw = None
+    raw = (
+        spark.readStream.format("cloudFiles")
+        .option("cloudFiles.format", file_format)
+        .option("cloudFiles.schemaLocation",checkpoint_path)
+        .options(**reader_options)
+        .load(source_path)
+    )
 
     # TODO 2: add the metadata columns.
     #   _ingested_at  F.current_timestamp()
     #   _source_file  the file path from the hidden _metadata column
     #   _batch        the <n> from "batch=<n>" in the file path (F.regexp_extract), cast to int
     #   Then drop the "batch" column Auto Loader infers from the folder names, so there is only one.
-    bronze = None
+    bronze = (
+        raw
+        .withColumn("_ingested_at",F.current_timestamp())
+        .withColumn("_source_file",F.col("_metadata.file_path"))
+        .withColumn("_batch", F.regexp_extract(F.col("_source_file"), r"batch=(\d+)", 1).cast("int"))        
+        .drop("batch")
+    )
+
+
+
 
     # TODO 3: write the stream to the bronze table.
     #   bronze.writeStream
@@ -60,11 +79,16 @@ def ingest_entity(entity: str, file_format: str, reader_options: dict) -> int:
     #   .option("mergeSchema", "true")     lets the table gain new columns (batch 5)
     #   .trigger(availableNow=True)
     #   .toTable(...)
-    query = None
+    query = (
+        bronze.writeStream
+        .option("checkpointLocation",checkpoint_path)
+        .option("mergeSchema", "true")
+        .trigger(availableNow=True)
+        .toTable(target_table)
+    )
 
     query.awaitTermination()
-    return sum(progress["numInputRows"] for progress in query.recentProgress)
-
+    return sum(progress.get("numInputRows") or 0 for progress in query.recentProgress)
 
 # COMMAND ----------
 

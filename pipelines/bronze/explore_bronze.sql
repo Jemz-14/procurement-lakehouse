@@ -11,6 +11,7 @@
 -- COMMAND ----------
 
 -- TODO 1: rows per _batch in bronze.purchase_orders (GROUP BY _batch ORDER BY _batch)
+SELECT _batch, count(*) FROM procurement.bronze.invoices GROUP BY _batch ORDER BY _batch;
 
 -- COMMAND ----------
 

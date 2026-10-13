@@ -1,4 +1,8 @@
 # Databricks notebook source
+# /// script
+# [tool.databricks.environment]
+# environment_version = "6"
+# ///
 # MAGIC %md
 # MAGIC # Run the procurement data generator
 # MAGIC
@@ -51,6 +55,6 @@ print(json.dumps(summary, indent=2))
 
 # COMMAND ----------
 
-# for batch_number in [1, 2, 3]:
-#     summary = procurement_generator.generate_batch(batch_number, **params)
-#     print(batch_number, {e: summary[e]["rows_written"] for e in procurement_generator.ENTITIES})
+for batch_number in [1, 2, 3]:
+    summary = procurement_generator.generate_batch(batch_number, **params)
+    print(batch_number, {e: summary[e]["rows_written"] for e in procurement_generator.ENTITIES})
