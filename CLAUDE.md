@@ -2,9 +2,20 @@
 
 ## Status (update at the end of every phase)
 
-- Current phase: **3 (Silver)**, first half: James writing TODOs 1 to 8 in `pipelines/silver/silver_transactions.py` (dedup, MERGE, explode). Second half (Fri 16): SCD Type 2 `dim_supplier`, batch 5 schema evolution test. Phases 0 to 2 done; batches 1 to 4 in bronze.
+- Current phase: **3 (Silver)**, second half. Done: `silver_transactions` (POs, lines, receipts, invoices, quarantine) incl. idempotency test (only pushed once James commits from Databricks). Next: `explore_silver`, then SCD Type 2 in `pipelines/silver/silver_dim_supplier.py` (James also writes the boilerplate, marked [B]), then the batch 5 schema evolution test, notes, quiz.
 - Catalog in use: `procurement` (CREATE CATALOG works on Free Edition)
-- Last session: Tue 13 Oct 2026 (about half a day behind schedule)
+- Last session: Mon 19 Oct 2026. About 3 days behind the original schedule; revised plan below.
+
+### Revised schedule (agreed Mon 19 Oct)
+
+| Day | Work |
+|---|---|
+| Mon 19 (5h) | explore_silver, SCD2 dim_supplier, batch 5 test, phase 3 notes and quiz; phase 4 concepts if time |
+| Tue 20 | Phase 4 (star schema, point-in-time SCD2 join, 3 marts: spend, OTIF, three-way match; no dashboard), Phase 5 (declarative pipeline, expectations, AUTO CDC) |
+| Wed 21 | Phase 6 (one job, deliberate failure, repair run), Phase 7 light (GRANTs, comments, lineage; no row filters), Phase 8 talk-through (one CLUSTER BY + OPTIMIZE), Phase 9 (walkthrough script, mock interview) |
+| Thu 22 | Light review only |
+
+James prefers to write boilerplate too where time allows; switch back to Claude writing it if behind.
 
 ## Context (read this first)
 
