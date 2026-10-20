@@ -44,3 +44,15 @@ TIMESTAMP AS OF '2026-10-12T13:20:00.000+00:00'
 
 -- TODO 6: DESCRIBE DETAIL bronze.purchase_orders. Where is the table stored, and how many files does it have?
 DESCRIBE DETAIL procurement.bronze.purchase_orders
+
+-- COMMAND ----------
+
+SELECT _batch, COUNT(*)
+FROM procurement.bronze.suppliers
+GROUP BY _batch
+ORDER BY _batch
+
+-- COMMAND ----------
+
+-- MAGIC %md
+-- MAGIC

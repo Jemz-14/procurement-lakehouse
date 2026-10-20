@@ -40,9 +40,7 @@ CREATE TABLE IF NOT EXISTS silver.po_lines (
   po_updated_at           TIMESTAMP     COMMENT 'updated_at of the PO version these lines came from',
   _source_file            STRING,
   _batch                  INT,
-  _ingested_at            TIMESTAMP,
-  CONSTRAINT positive_quantity CHECK (quantity > 0),
-  CONSTRAINT non_negative_price CHECK (unit_price >= 0)
+  _ingested_at            TIMESTAMP
 )
 COMMENT 'One row per purchase order line, from the latest valid PO version';
 
@@ -56,8 +54,7 @@ CREATE TABLE IF NOT EXISTS silver.goods_receipts (
   received_date  DATE,
   _source_file   STRING,
   _batch         INT,
-  _ingested_at   TIMESTAMP,
-  CONSTRAINT positive_received_qty CHECK (received_qty > 0)
+  _ingested_at   TIMESTAMP
 )
 COMMENT 'One row per goods receipt';
 
@@ -73,8 +70,7 @@ CREATE TABLE IF NOT EXISTS silver.invoices (
   paid_date     DATE          COMMENT 'NULL means unpaid',
   _source_file  STRING,
   _batch        INT,
-  _ingested_at  TIMESTAMP,
-  CONSTRAINT non_negative_amount CHECK (amount >= 0)
+  _ingested_at  TIMESTAMP
 )
 COMMENT 'One row per supplier invoice';
 
@@ -91,6 +87,40 @@ CREATE TABLE IF NOT EXISTS ops.quarantine (
   quarantined_at  TIMESTAMP
 )
 COMMENT 'Rows rejected by silver validation, with the reason';
+
+-- COMMAND ----------
+
+CREATE TABLE IF NOT EXISTS silver.dim_supplier (
+  supplier_sk         BIGINT GENERATED ALWAYS AS IDENTITY COMMENT 'Surrogate key, assigned by Delta',
+  supplier_id         STRING    NOT NULL COMMENT 'Business key',
+  name                STRING,
+  country             STRING,
+  category            STRING,
+  payment_terms_days  INT,
+  status              STRING,
+  valid_from          TIMESTAMP NOT NULL COMMENT 'Start of this version (source updated_at)',
+  valid_to            TIMESTAMP COMMENT 'End of this version; NULL means still valid',
+  is_current          BOOLEAN   NOT NULL,
+  _source_file        STRING,
+  _batch              INT,
+  _ingested_at        TIMESTAMP
+)
+COMMENT 'Supplier dimension, SCD Type 2: one row per supplier version';
+
+-- COMMAND ----------
+
+-- CHECK constraints are added after creation. DROP ... IF EXISTS first keeps this cell rerunnable.
+ALTER TABLE silver.po_lines DROP CONSTRAINT IF EXISTS positive_quantity;
+ALTER TABLE silver.po_lines ADD CONSTRAINT positive_quantity CHECK (quantity > 0);
+
+ALTER TABLE silver.po_lines DROP CONSTRAINT IF EXISTS non_negative_price;
+ALTER TABLE silver.po_lines ADD CONSTRAINT non_negative_price CHECK (unit_price >= 0);
+
+ALTER TABLE silver.goods_receipts DROP CONSTRAINT IF EXISTS positive_received_qty;
+ALTER TABLE silver.goods_receipts ADD CONSTRAINT positive_received_qty CHECK (received_qty > 0);
+
+ALTER TABLE silver.invoices DROP CONSTRAINT IF EXISTS non_negative_amount;
+ALTER TABLE silver.invoices ADD CONSTRAINT non_negative_amount CHECK (amount >= 0);
 
 -- COMMAND ----------
 

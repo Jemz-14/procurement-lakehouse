@@ -1,4 +1,8 @@
 # Databricks notebook source
+# /// script
+# [tool.databricks.environment]
+# environment_version = "6"
+# ///
 # MAGIC %md
 # MAGIC # Silver: purchase orders, PO lines, goods receipts, invoices
 # MAGIC
@@ -16,12 +20,6 @@
 
 # COMMAND ----------
 
-dbutils.widgets.text("catalog", "procurement")
-catalog = dbutils.widgets.get("catalog")
-checkpoint_root = f"/Volumes/{catalog}/ops/checkpoints/silver"
-
-# COMMAND ----------
-
 # MAGIC %md
 # MAGIC ## Shared helpers
 # MAGIC Everything a `foreachBatch` function uses is defined in this notebook, because the
@@ -29,70 +27,7 @@ checkpoint_root = f"/Volumes/{catalog}/ops/checkpoints/silver"
 
 # COMMAND ----------
 
-from pyspark.sql import DataFrame, functions as F
-
-TECHNICAL_COLUMNS = ["_source_file", "_batch", "_ingested_at"]
-
-
-def try_cast(column: str, sql_type: str):
-    """Cast that returns NULL for bad values instead of failing (serverless runs in ANSI mode)."""
-    return F.expr(f"try_cast({column} AS {sql_type})")
-
-
-def standardise(column: str):
-    """Fix soft defects in codes: ' active ' and 'cc-200' become 'ACTIVE' and 'CC-200'."""
-    return F.upper(F.trim(F.col(column)))
-
-
-def add_reject_reason(df: DataFrame, rules: list) -> DataFrame:
-    """reject_reason lists every rule the row failed, separated by '; '. Empty string means valid."""
-    failed = [F.when(F.coalesce(condition, F.lit(False)), F.lit(reason)) for reason, condition in rules]
-    return df.withColumn("reject_reason", F.concat_ws("; ", *failed))
-
-
-def write_quarantine(rejected: DataFrame, entity: str, key_column: str) -> None:
-    """Insert rejected rows into ops.quarantine. Insert-only MERGE on a hash, so a replay adds nothing."""
-    rows = (
-        rejected.select(
-            F.lit(entity).alias("entity"),
-            F.col(key_column).alias("business_key"),
-            "reject_reason",
-            F.col("_raw").alias("raw_record"),
-            "_source_file",
-            "_batch",
-            F.current_timestamp().alias("quarantined_at"),
-        )
-        .withColumn("quarantine_id", F.sha2(F.concat_ws("|", "entity", "raw_record", "_source_file"), 256))
-        .dropDuplicates(["quarantine_id"])
-    )
-    rows.createOrReplaceTempView("quarantine_updates")
-    rejected.sparkSession.sql(f"""
-        MERGE INTO {catalog}.ops.quarantine AS t
-        USING quarantine_updates AS s
-        ON t.quarantine_id = s.quarantine_id
-        WHEN NOT MATCHED THEN INSERT *
-    """)
-
-
-def split_valid(cleaned: DataFrame, rules: list, entity: str, key_column: str, valid_view: str) -> None:
-    """Validate, quarantine the failures, and register the valid rows as a temp view."""
-    checked = add_reject_reason(cleaned, rules)
-    write_quarantine(checked.filter("reject_reason != ''"), entity, key_column)
-    checked.filter("reject_reason = ''").drop("reject_reason", "_raw").createOrReplaceTempView(valid_view)
-
-
-def run_incremental(source_table: str, checkpoint_name: str, process_batch) -> None:
-    """Stream new rows from a bronze table through process_batch, then stop."""
-    query = (
-        spark.readStream.table(source_table)
-        .writeStream
-        .foreachBatch(process_batch)
-        .option("checkpointLocation", f"{checkpoint_root}/{checkpoint_name}")
-        .trigger(availableNow=True)
-        .start()
-    )
-    query.awaitTermination()
-
+# MAGIC %run ./silver_helpers
 
 # COMMAND ----------
 
@@ -103,6 +38,10 @@ def run_incremental(source_table: str, checkpoint_name: str, process_batch) -> N
 
 PO_FIELDS = ["po_id", "supplier_id", "buyer", "cost_centre", "order_date", "status", "updated_at", "lines"]
 PO_STATUSES = ["APPROVED", "PARTIALLY_RECEIVED", "RECEIVED", "CLOSED", "CANCELLED"]
+LINES_SCHEMA = (
+    "array<struct<po_line_id: string, item: string, category: string, "
+    "quantity: string, unit_price: string, expected_delivery_date: string>>"
+)
 
 
 def clean_purchase_orders(bronze: DataFrame) -> DataFrame:
@@ -118,7 +57,7 @@ def clean_purchase_orders(bronze: DataFrame) -> DataFrame:
         try_cast("order_date", "DATE").alias("order_date"),
         standardise("status").alias("status"),
         try_cast("updated_at", "TIMESTAMP").alias("updated_at"),
-        "lines",
+        F.from_json("lines", LINES_SCHEMA).alias("lines"),
         *new_columns,
         *TECHNICAL_COLUMNS,
     )
@@ -152,6 +91,12 @@ def process_purchase_orders(batch_df: DataFrame, batch_id: int) -> None:
     #   would add them to the silver table.
     session.sql("""
         -- TODO 1
+        SELECT *
+        FROM po_valid
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY po_id
+            ORDER BY updated_at DESC, _ingested_at DESC, _source_file
+        ) = 1
     """).createOrReplaceTempView("po_latest")
 
     # TODO 2: MERGE the PO headers into silver.purchase_orders.
@@ -163,7 +108,17 @@ def process_purchase_orders(batch_df: DataFrame, batch_id: int) -> None:
     #   - UPDATE SET * and INSERT * so a new column like contract_id flows through
     session.sql(f"""
         -- TODO 2
-    """)
+        MERGE WITH SCHEMA EVOLUTION INTO {catalog}.silver.purchase_orders AS t
+        USING(
+            SELECT * EXCEPT (lines)
+            FROM po_latest
+        ) AS s
+        ON t.po_id = s.po_id
+        WHEN MATCHED AND s.updated_at > t.updated_at
+            THEN UPDATE SET *
+        WHEN NOT MATCHED
+            THEN INSERT *
+ """)
 
     # TODO 3: one row per PO line from po_latest.
     #   explode(lines) AS line, then select:
@@ -173,12 +128,41 @@ def process_purchase_orders(batch_df: DataFrame, batch_id: int) -> None:
     #   updated_at AS po_updated_at, plus _source_file, _batch, _ingested_at.
     session.sql("""
         -- TODO 3
+        WITH ExplodePO AS(
+            SELECT *,
+            explode(lines) AS line
+            FROM po_latest
+        )
+        SELECT
+            line.po_line_id,
+            po_id,
+            line.item,
+            line.category,
+            try_cast(line.quantity AS INT) AS quantity,
+            try_cast(line.unit_price AS DECIMAL(18,2)) AS unit_price,
+            try_cast(line.expected_delivery_date AS DATE) AS expected_delivery_date,
+            updated_at AS po_updated_at,
+            _source_file,
+            _batch,
+            _ingested_at
+        FROM ExplodePO
+        
     """).createOrReplaceTempView("po_lines_latest")
 
     # TODO 4: MERGE po_lines_latest into silver.po_lines.
     #   Same pattern as TODO 2: key po_line_id, update only when po_updated_at is newer.
     session.sql(f"""
         -- TODO 4
+        MERGE WITH SCHEMA EVOLUTION INTO {catalog}.silver.po_lines AS t
+        USING (
+            SELECT *
+            FROM po_lines_latest
+        ) AS s
+        ON t.po_line_id = s.po_line_id
+        WHEN MATCHED AND s.po_updated_at > t.po_updated_at
+            THEN UPDATE SET *
+        WHEN NOT MATCHED
+            THEN INSERT *
     """)
 
 
@@ -223,12 +207,24 @@ def process_goods_receipts(batch_df: DataFrame, batch_id: int) -> None:
     #   (so _batch shows when the receipt first arrived), ties broken by _source_file.
     session.sql("""
         -- TODO 5
+        SELECT *
+        FROM receipts_valid
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY receipt_id 
+        ORDER BY _ingested_at, _source_file) = 1
     """).createOrReplaceTempView("receipts_latest")
 
     # TODO 6: insert-only MERGE into silver.goods_receipts.
     #   Receipts never change once sent, so there is no WHEN MATCHED clause.
     session.sql(f"""
         -- TODO 6
+        MERGE WITH SCHEMA EVOLUTION INTO {catalog}.silver.goods_receipts AS t
+        USING (
+            SELECT *
+            FROM receipts_latest
+        ) AS s
+        ON t.receipt_id = s.receipt_id
+        WHEN NOT MATCHED
+            THEN INSERT *
     """)
 
 
@@ -275,11 +271,23 @@ def process_invoices(batch_df: DataFrame, batch_id: int) -> None:
     # TODO 7: same as TODO 5, for invoice_id.
     session.sql("""
         -- TODO 7
+        SELECT *
+        FROM invoices_valid
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY invoice_id
+        ORDER BY _ingested_at, _source_file) = 1
     """).createOrReplaceTempView("invoices_latest")
 
     # TODO 8: same as TODO 6, into silver.invoices.
     session.sql(f"""
         -- TODO 8
+        MERGE WITH SCHEMA EVOLUTION INTO {catalog}.silver.invoices AS t
+        USING (
+            SELECT *
+            FROM invoices_latest
+        ) AS s
+        ON t.invoice_id = s.invoice_id
+        WHEN NOT MATCHED
+            THEN INSERT *
     """)
 
 
@@ -313,7 +321,7 @@ display(spark.sql(f"""
 # COMMAND ----------
 
 # for name in ["purchase_orders", "goods_receipts", "invoices"]:
-#     dbutils.fs.rm(f"{checkpoint_root}/{name}", True)
+#   dbutils.fs.rm(f"{checkpoint_root}/{name}", True)
 
 # COMMAND ----------
 
