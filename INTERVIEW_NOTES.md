@@ -215,3 +215,80 @@ The source delivers files in batches, not continuously, so a stream running all 
 
 **What makes a Delta write ACID, how does time travel work, and how did you prove batch 4 loaded once?**
 A Delta table is a set of Parquet files plus a transaction log. A write first adds new data files, then commits by creating the next numbered entry in `_delta_log`. Until that commit exists, readers do not see the new files, so a write is either fully visible or not visible at all. Readers always read one complete version, and if two writers try to commit at the same time, Delta's optimistic concurrency control lets one succeed and makes the other retry or fail, so the table is never corrupted. Time travel reads an older version with `VERSION AS OF` or `TIMESTAMP AS OF`. It is limited by retention: `VACUUM` deletes old data files after seven days by default, and the log itself is kept for 30 days by default. To prove batch 4 loaded exactly once, I checked four things: rows per `_batch` showed batch 4 with exactly the row count the generator wrote and earlier batches unchanged; `DESCRIBE HISTORY` showed one new commit whose `numOutputRows` matched; `VERSION AS OF` the previous version returned the old total; and a further run with no new files added no rows.
+
+---
+
+## Phase 3: Silver
+
+### What we built
+
+Silver tables for purchase orders, PO lines, goods receipts and invoices, plus `dim_supplier` as a hand-written SCD Type 2 dimension, and `ops.quarantine` for rejected rows. Each pipeline streams new rows from bronze with `readStream.table`, and in `foreachBatch` it types and standardises the data, validates it, sends failures to quarantine, deduplicates with `ROW_NUMBER` and `QUALIFY`, and MERGEs on the business key. Shared helpers live in one `silver_helpers` notebook that the pipeline notebooks load with `%run`. The tables are created up front with explicit DDL, comments and CHECK constraints.
+
+What I proved: deleting the silver checkpoints and reprocessing everything changed no row counts, and `DESCRIBE HISTORY` showed the replayed MERGEs inserting and updating 0 rows. I also hit a real crash halfway through a micro-batch: the header MERGE had committed and the lines step failed. When I fixed the code and reran, the batch was replayed and the header MERGE changed nothing the second time. For `dim_supplier`, there is exactly one current row per supplier (48 suppliers, 48 current rows, 66 versions after batch 4). In batch 5 the source added `contract_id`, and the pipeline picked it up (see decision 9).
+
+### Decisions, why, and the alternative
+
+**1. `foreachBatch` with MERGE on business keys, so every write is idempotent.**
+- Why: `foreachBatch` is at-least-once. After a failure, the same micro-batch can run again. A plain append would then duplicate rows, but a MERGE on the business key gives the same result however many times it runs.
+- Alternative: append with Delta's idempotent write options, `txnAppId` and `txnVersion` set to the batch ID. That works for appends but not for upserts, and it breaks if the checkpoint is reset while the app ID stays the same. In phase 5, AUTO CDC does this declaratively.
+
+**2. Validate first, then deduplicate, and guard the MERGE with `updated_at`.**
+- Why: if a batch contains a good older version and a bad newer version of the same PO, silver keeps the latest valid one instead of losing the PO. The MERGE only updates when the incoming `updated_at` is newer than the target's, so a late-arriving older copy can never overwrite newer data.
+- Alternative: deduplicate first. Simpler, but a corrupt latest version would push a good row into quarantine.
+
+**3. Quarantine with every failed rule, the raw record, and a hash ID.**
+- Why: `reject_reason` lists every rule a row failed, so whoever fixes the source sees all problems at once. `raw_record` keeps the original bronze row, so nothing is lost. The `quarantine_id` is a hash of the entity, the raw record and the source file, and quarantine is loaded with an insert-only MERGE on it, so replays do not duplicate rejects.
+- Alternative: drop bad rows silently, which hides problems, or fail the whole pipeline on one bad row, which stops good data for everyone.
+
+**4. Hard defects are rejected; soft defects are standardised.**
+- Why: `upper(trim(status))` turns `' active '` into `ACTIVE`, which is the right value in the wrong format. A negative quantity or a 30 February date is wrong, and guessing a fix would put bad numbers in front of finance.
+
+**5. Silver only checks rules within one row. Cross-entity checks come later.**
+- Why: data arrives out of order. A receipt can legitimately arrive before its PO, so rejecting "receipt for an unknown PO" in silver would throw away valid data. Unknown supplier IDs and unknown PO lines are kept, flagged by data quality checks, and mapped to an "unknown" dimension member in gold.
+
+**6. A PO is rejected as a whole if any of its lines is bad.**
+- Why: header and lines stay consistent. The next valid version of the PO replaces it.
+
+**7. Nested JSON is parsed in silver with an explicit schema.**
+- Why: bronze keeps the PO lines as the original JSON text, because it stores everything as delivered. Silver parses them with `from_json` against an explicit schema, so the structure is a contract rather than a guess. Unparseable lines become null and are quarantined by the "no lines" rule.
+
+**8. Explicit table DDL with types, comments and CHECK constraints; money as `DECIMAL(18,2)`.**
+- Why: the table definition is the data contract for consumers. CHECK constraints such as `quantity > 0` are a safety net: if validation ever misses something, the write fails rather than storing bad data. Delta only allows CHECK constraints through `ALTER TABLE ... ADD CONSTRAINT`, not inline in `CREATE TABLE`. Decimals are exact; doubles cannot represent amounts like 0.10 exactly.
+
+**9. New source columns flow through automatically.**
+- Why: the cleaning step passes through any column it does not recognise, and `MERGE WITH SCHEMA EVOLUTION` adds it to the silver table. Old rows get null, so nothing downstream breaks. That is a backward-compatible schema change. Auto Loader stops once when it sees the new column (`addNewColumns` mode) and works on restart; the silver stream reading bronze can also stop once when the bronze schema changes. A job retry handles both.
+- Alternative: contract-first, where unknown columns are ignored until an engineer adds them deliberately. Safer for certified datasets, but slower to pick up changes. A sensible middle ground is to auto-evolve silver but add new columns to gold deliberately.
+
+**10. SCD Type 2 written by hand with a single MERGE.**
+- Why: closing the old version and inserting the new one must happen atomically. The staged source contains each change twice: a close row with `merge_key = supplier_id`, which matches the current row and closes it, and an insert row with `merge_key = NULL`, which can never match and is therefore inserted. A batch can hold several versions of one supplier, so I close the current row at the earliest new version and insert every new version, with `valid_to` taken from `LEAD(updated_at)`. Only versions newer than the current row are processed, so a replay changes nothing. `supplier_sk` is an identity column, because `supplier_id` is no longer unique once history is kept.
+- Limitations I would mention: a genuinely new version that arrives out of order, older than the current one, is ignored and would need a backfill. A re-sent version with no attribute changes but a newer timestamp would create a new version; in production I would compare a hash of the tracked attributes.
+- Alternative: AUTO CDC in a declarative pipeline (phase 5), which does all of this from a few lines of configuration.
+
+**11. Receipts and invoices are insert-only, and the earliest copy wins.**
+- Why: they never change once sent in this source, and keeping the first copy means `_batch` records when each one first arrived, which matters for late-arrival analysis.
+
+### Problems I hit and fixed (good stories to tell)
+
+- **Inline CHECK constraints are not supported in `CREATE TABLE`**: Delta only accepts primary and foreign keys inline, so I moved them to `ALTER TABLE ... ADD CONSTRAINT`.
+- **Nested JSON landed in bronze as a string**, because Auto Loader infers strings by default, including for nested structures. My `exists(lines, ...)` rule failed with a type error, which led to parsing with `from_json` in silver.
+- **`x AS INT` renames a column, it does not cast it.** You need `try_cast(x AS INT) AS x`.
+- **A silent SCD2 bug, caught in review:** `ON ... AND t.is_current IS NULL` never matches, so old rows would never close and suppliers would get two current rows, with no error. The check "current rows equals distinct suppliers" exists to catch exactly that.
+- **Widget defaults only apply when the widget is first created.** Changing the default in code did not change the batch number. Because the generator is deterministic and Auto Loader ignores files it has already processed, regenerating batch 4 by mistake changed nothing.
+- **On serverless, the streaming progress metric `numInputRows` was empty**, so I count rows from the table and from `DESCRIBE HISTORY` instead.
+
+### Quiz answers to say out loud
+
+**Take one purchase order from bronze to silver.**
+"Silver reads only the new rows from bronze, using a streaming read on the bronze table, and processes each micro-batch in `foreachBatch`. First it cleans the record: it trims the IDs, upper-cases and trims codes like status and cost centre, converts dates and timestamps with `try_cast` so bad values become null instead of failing, and parses the nested lines from JSON text with an explicit schema. Then it checks the validation rules, and every rule the row fails is listed in `reject_reason`. Failed rows go to `ops.quarantine` with the reason and the original raw record. Valid rows are deduplicated to one per `po_id`, keeping the newest `updated_at`, and merged into `silver.purchase_orders`. The MERGE only updates when the incoming version is newer, so an older copy arriving late cannot overwrite it. Finally the lines are exploded to one row per line and merged into `silver.po_lines` the same way. A negative quantity on any line fails the line quantity rule, so the whole PO version is quarantined, which keeps the header and lines consistent. A status of `' approved '` is not an error: it is the right value in the wrong format, so it is standardised to `APPROVED` and the row is kept."
+
+**What does at-least-once mean, and how did you make silver safe to rerun?**
+"At-least-once means that after a failure, Spark can run the same micro-batch again, because the checkpoint only records a batch as finished once the whole `foreachBatch` function succeeds. So every write inside it must give the same result when repeated. I made all of them MERGEs on the business key: POs and lines only update when the source is newer, receipts and invoices are insert-only, and quarantine is an insert-only MERGE on a hash of the record. This was tested for real: a run failed halfway through a batch, after the header MERGE had committed but before the lines step. When I fixed the code and reran, Spark replayed that batch, and `DESCRIBE HISTORY` showed the header MERGE inserting and updating 0 rows. I then deleted the checkpoints on purpose to force a full reprocess, and the row counts did not change."
+
+**Walk me through your SCD Type 2 MERGE.**
+"Changing a supplier needs two actions at once: close the current version and insert the new one, and they must be atomic. A MERGE can only take one action per matched row, so I build a staged source that contains each change twice. The close row has `merge_key` set to the supplier ID, so it matches the supplier's current row, and the MERGE sets that row's `valid_to` and makes it not current. The insert row has `merge_key` set to NULL. NULL never equals anything, so it can never match, and it falls through to `WHEN NOT MATCHED`, where it is inserted as a new version. I also guard the insert with `merge_key IS NULL`, so a brand-new supplier's close row, which matches nothing, is not inserted a second time. If one batch has three new versions of the same supplier, I first keep only versions newer than the current row, then use `LEAD` to give each version a `valid_to` equal to the next version's start. The current row is closed at the earliest new version, all three are inserted, and only the last one is current. To detect a broken implementation, I check that the number of current rows equals the number of distinct suppliers, that each version's `valid_to` equals the next version's `valid_from`, and that rerunning the same data changes nothing."
+
+**What happened when batch 5 added `contract_id`, and would you let gold evolve the same way?**
+"In bronze, Auto Loader noticed the new column, added it to the schema stored in the schema location, and deliberately stopped the stream. The rerun loaded the file with the new schema, and `mergeSchema` added the column to the bronze table. In silver, the cleaning step passes through any column it does not recognise, and `MERGE WITH SCHEMA EVOLUTION` with `UPDATE SET *` and `INSERT *` added `contract_id` to the silver table. Older POs simply have null, so nothing that used the table before breaks: that is a backward-compatible change. I would not let gold evolve automatically. Gold tables are certified datasets that dashboards and KPIs depend on, so a new column there should be added deliberately, documented, and communicated through change control. My approach would be to evolve silver automatically and promote new columns into gold on purpose."
+
+**Why `ROW_NUMBER` and not `RANK`, why the extra `ORDER BY` columns, and how would you write it without `QUALIFY`?**
+"`ROW_NUMBER` gives every row in a partition a unique number, so filtering on 1 always keeps exactly one row per key. `RANK` and `DENSE_RANK` give tied rows the same number, so two copies with the same `updated_at` would both be ranked 1 and both kept, which defeats deduplication. The extra columns, `_ingested_at` and `_source_file`, are tie-breakers. If two copies have the same `updated_at` and nothing else decides between them, Spark can return either one, and the result might change between runs. The tie-breakers make the choice deterministic, so the same input always gives the same output. Without `QUALIFY`, you compute the row number in a subquery and filter in the outer query, because `WHERE` is evaluated before window functions and cannot reference them directly: `SELECT * EXCEPT (rn) FROM (SELECT *, ROW_NUMBER() OVER (...) AS rn FROM po_valid) WHERE rn = 1`. `QUALIFY` is simply a filter that runs after the window functions, like `HAVING` runs after aggregation."

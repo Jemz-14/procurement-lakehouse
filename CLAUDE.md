@@ -2,7 +2,7 @@
 
 ## Status (update at the end of every phase)
 
-- Current phase: **3 (Silver)**, second half. Done: `silver_transactions` (POs, lines, receipts, invoices, quarantine) incl. idempotency test (only pushed once James commits from Databricks). Next: `explore_silver`, then SCD Type 2 in `pipelines/silver/silver_dim_supplier.py` (James also writes the boilerplate, marked [B]), then the batch 5 schema evolution test, notes, quiz.
+- Current phase: **4 (Gold)** in progress: James writing F1, F2 (point-in-time joins) and M1 to M3 (marts) in `pipelines/gold/gold_build.sql`; Claude wrote the dims and fact_receipt. Phase 3 done (dim_supplier idempotency confirmed: 76 versions, 51 current, 51 suppliers after batch 5). Next: phase 5 (Tue 20).
 - Catalog in use: `procurement` (CREATE CATALOG works on Free Edition)
 - Last session: Mon 19 Oct 2026. About 3 days behind the original schedule; revised plan below.
 
