@@ -16,9 +16,10 @@ USE CATALOG procurement;
 -- For silver.purchase_orders: GROUP BY po_id HAVING count(*) > 1 must return no rows.
 -- Repeat for po_lines (po_line_id), goods_receipts (receipt_id), invoices (invoice_id).
 
-SELECT invoice_id
-FROM silver.invoices
-GROUP BY invoice_id HAVING COUNT(*) > 1
+SELECT *
+FROM silver.dim_supplier
+LIMIT 10;
+
 
 
 -- COMMAND ----------
