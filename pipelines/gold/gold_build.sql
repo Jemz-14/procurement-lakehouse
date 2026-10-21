@@ -80,6 +80,37 @@ SELECT -1, 'UNKNOWN', 'Unknown supplier', NULL, NULL, NULL, NULL, TIMESTAMP'1900
 
 -- TODO F1 [core]: gold.fact_po_line, one row per PO line.
 --
+
+CREATE OR REPLACE TABLE gold.fact_po_line
+COMMENT 'One row per purchase order line, joined to the supplier version valid on the order date'
+AS
+SELECT
+  l.po_line_id,
+  l.po_id,
+  coalesce(d.supplier_sk, -1)                                     AS supplier_sk,
+  c.category_key,
+  CAST(date_format(h.order_date, 'yyyyMMdd') AS INT)              AS order_date_key,
+  CAST(date_format(l.expected_delivery_date, 'yyyyMMdd') AS INT)  AS expected_delivery_date_key,
+  h.order_date,
+  l.expected_delivery_date,
+  h.buyer,
+  h.cost_centre,
+  h.status                                                        AS po_status,
+  h.contract_id,
+  l.quantity,
+  l.unit_price,
+  l.quantity * l.unit_price                                       AS line_amount
+FROM silver.po_lines AS l
+JOIN silver.purchase_orders AS h
+  ON l.po_id = h.po_id
+LEFT JOIN silver.dim_supplier AS d
+  ON h.supplier_id = d.supplier_id
+ AND CAST(h.order_date AS TIMESTAMP) >= d.valid_from
+ AND (d.valid_to IS NULL OR CAST(h.order_date AS TIMESTAMP) < d.valid_to)
+LEFT JOIN gold.dim_category AS c
+  ON c.category_name = l.category;
+
+
 -- CREATE OR REPLACE TABLE gold.fact_po_line COMMENT '...' AS
 -- FROM silver.po_lines AS l
 --   JOIN silver.purchase_orders AS h            on po_id (every line has a valid header)
@@ -127,6 +158,27 @@ LEFT JOIN silver.po_lines AS l ON l.po_line_id = r.po_line_id;
 --   invoice_date_key, invoice_date, due_date, paid_date, amount,
 --   po_id IS NULL AS is_maverick
 
+CREATE OR REPLACE TABLE gold.fact_invoice
+COMMENT 'One row per invoice'
+AS
+SELECT
+invoice_id,
+po_id,
+coalesce(supplier_sk,-1) AS supplier_sk,
+i.supplier_id,
+CAST(date_format(invoice_date,'yyyyMMdd') AS INT) AS invoice_date_key,
+invoice_date,
+due_date,
+paid_date,
+amount
+
+FROM silver.invoices i
+LEFT JOIN silver.dim_supplier d 
+ON i.supplier_id = d.supplier_id
+AND CAST(i.invoice_date AS TIMESTAMP) >= d.valid_from
+AND(d.valid_to IS NULL OR CAST(i.invoice_date AS TIMESTAMP) < d.valid_to)
+
+
 
 
 -- COMMAND ----------
@@ -146,24 +198,85 @@ LEFT JOIN silver.po_lines AS l ON l.po_line_id = r.po_line_id;
 --   Window functions on top of the aggregate (use a CTE for the aggregate first):
 --     cumulative_spend   running total per supplier and category, ordered by year_month
 --     share_of_month_pct spend / SUM(spend) OVER (PARTITION BY year_month) * 100
+CREATE OR REPLACE TABLE gold.mart_spend_monthly
+COMMENT 'Spend by month, supplier and category (cancelled POs excluded)'
+AS
+
+WITH monthly AS (
+    SELECT
+        dt.year_month,
+        s.supplier_id,
+        s.supplier_name,
+        c.category_name,
+        SUM(f.line_amount) AS spend,
+        COUNT(DISTINCT f.po_id) AS po_count,
+        COUNT(*) AS line_count
+    FROM gold.fact_po_line AS f
+    JOIN gold.dim_supplier AS s
+    ON f.supplier_sk = s.supplier_sk
+    JOIN gold.dim_category AS c
+    ON f.category_key = c.category_key
+    JOIN gold.dim_date AS dt
+    ON f.order_date_key = dt.date_key
+    WHERE f.po_status <> 'CANCELLED'
+    GROUP BY dt.year_month, s.supplier_id, s.supplier_name, c.category_name
+
+
+)
+
+SELECT *,
+SUM(spend) OVER (PARTITION BY supplier_id,category_name ORDER BY year_month) AS cumulative_spend,
+ROUND(spend/SUM(spend) OVER (PARTITION BY year_month)* 100,2) AS    share_of_month_pct
+FROM monthly;
+
+
 
 
 
 -- COMMAND ----------
 
--- TODO M2 [core]: gold.mart_supplier_performance, one row per (supplier, year_month of expected delivery).
---   Step 1 (CTE): one row per PO line that has been received:
---     received_qty = SUM(r.received_qty), last_received_date = MAX(r.received_date)
---     from fact_receipt, GROUP BY po_line_id. Aggregate BEFORE joining, so a line with two
---     receipts is not counted twice.
---   Step 2: join to fact_po_line and flag each line:
---     is_on_time = last_received_date <= expected_delivery_date
---     is_in_full = received_qty >= quantity
---     is_otif    = both
---   Step 3: group by supplier and month (dim_supplier, dim_date on expected_delivery_date_key):
---     lines_received, on_time_pct, in_full_pct, otif_pct  (hint: avg(CAST(flag AS INT)) * 100)
+select year_month,
+ROUND(SUM(share_of_month_pct))
+FROM gold.mart_spend_monthly
+GROUP BY year_month
+ORDER BY year_month;
 
+-- COMMAND ----------
 
+CREATE OR REPLACE TABLE gold.mart_supplier_performance
+COMMENT 'Supplier delivery performance by month of expected delivery: on time, in full, OTIF'
+AS
+WITH received AS (
+    SELECT
+        r.po_line_id,
+        SUM(r.received_qty)  AS received_qty,
+        MAX(r.received_date) AS last_received_date
+    FROM gold.fact_receipt AS r
+    GROUP BY r.po_line_id
+),
+flagged AS (
+    SELECT
+        f.supplier_sk,
+        f.expected_delivery_date_key,
+        rc.last_received_date <= f.expected_delivery_date AS is_on_time,
+        rc.received_qty >= f.quantity                     AS is_in_full,
+        rc.last_received_date <= f.expected_delivery_date
+          AND rc.received_qty >= f.quantity               AS is_otif
+    FROM gold.fact_po_line AS f
+    JOIN received AS rc ON rc.po_line_id = f.po_line_id
+)
+SELECT
+    s.supplier_id,
+    s.supplier_name,
+    dt.year_month,
+    COUNT(*)                                        AS lines_received,
+    ROUND(AVG(CAST(fl.is_on_time AS INT)) * 100, 1) AS on_time_pct,
+    ROUND(AVG(CAST(fl.is_in_full AS INT)) * 100, 1) AS in_full_pct,
+    ROUND(AVG(CAST(fl.is_otif    AS INT)) * 100, 1) AS otif_pct
+FROM flagged AS fl
+JOIN gold.dim_supplier AS s  ON fl.supplier_sk = s.supplier_sk
+JOIN gold.dim_date     AS dt ON fl.expected_delivery_date_key = dt.date_key
+GROUP BY s.supplier_id, s.supplier_name, dt.year_month;
 
 -- COMMAND ----------
 
@@ -181,6 +294,59 @@ LEFT JOIN silver.po_lines AS l ON l.po_line_id = r.po_line_id;
 --   Include variance = invoiced - received, and is_exception = match_status NOT IN ('MATCHED', 'NOT_INVOICED').
 
 
+CREATE OR REPLACE TABLE gold.mart_invoice_match
+AS
+WITH ordered AS (
+    SELECT
+        po_id,
+        SUM(line_amount) AS ordered_amount
+    FROM gold.fact_po_line
+    GROUP BY po_id
+),
+received AS (
+    SELECT
+        r.po_id,
+        SUM(r.received_qty * f.unit_price) AS received_amount
+    FROM gold.fact_receipt AS r
+    JOIN gold.fact_po_line AS f
+    ON r.po_line_id = f.po_line_id
+    GROUP BY r.po_id
+),
+
+invoiced AS (
+    SELECT
+        po_id,
+        SUM(amount) AS invoiced_amount
+    FROM gold.fact_invoice
+    WHERE po_id IS NOT NULL
+    GROUP BY po_id
+)
+SELECT
+    o.po_id,
+    o.ordered_amount,
+    coalesce(r.received_amount, 0)                                  AS received_amount,
+    coalesce(i.invoiced_amount, 0)                                  AS invoiced_amount,
+    coalesce(i.invoiced_amount, 0) - coalesce(r.received_amount, 0) AS variance,
+    CASE
+        WHEN r.po_id IS NULL THEN 'NOT_RECEIVED'
+        WHEN i.po_id IS NULL THEN 'NOT_INVOICED'
+        WHEN abs(i.invoiced_amount - r.received_amount) <= 0.01 * r.received_amount THEN 'MATCHED'
+        WHEN i.invoiced_amount > r.received_amount THEN 'OVER_INVOICED'
+        ELSE 'UNDER_INVOICED'
+    END                                                             AS match_status
+FROM ordered AS o
+LEFT JOIN received AS r ON r.po_id = o.po_id
+LEFT JOIN invoiced AS i ON i.po_id = o.po_id
+WHERE r.po_id IS NOT NULL OR i.po_id IS NOT NULL;
+
+-- COMMAND ----------
+
+SELECT * FROM gold.mart_invoice_match 
+
+-- COMMAND ----------
+
+-- MAGIC %md
+-- MAGIC
 
 -- COMMAND ----------
 
