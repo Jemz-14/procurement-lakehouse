@@ -292,3 +292,68 @@ What I proved: deleting the silver checkpoints and reprocessing everything chang
 
 **Why `ROW_NUMBER` and not `RANK`, why the extra `ORDER BY` columns, and how would you write it without `QUALIFY`?**
 "`ROW_NUMBER` gives every row in a partition a unique number, so filtering on 1 always keeps exactly one row per key. `RANK` and `DENSE_RANK` give tied rows the same number, so two copies with the same `updated_at` would both be ranked 1 and both kept, which defeats deduplication. The extra columns, `_ingested_at` and `_source_file`, are tie-breakers. If two copies have the same `updated_at` and nothing else decides between them, Spark can return either one, and the result might change between runs. The tie-breakers make the choice deterministic, so the same input always gives the same output. Without `QUALIFY`, you compute the row number in a subquery and filter in the outer query, because `WHERE` is evaluated before window functions and cannot reference them directly: `SELECT * EXCEPT (rn) FROM (SELECT *, ROW_NUMBER() OVER (...) AS rn FROM po_valid) WHERE rn = 1`. `QUALIFY` is simply a filter that runs after the window functions, like `HAVING` runs after aggregation."
+
+---
+
+## Phase 4: Gold
+
+### What we built
+
+A star schema in `procurement.gold`, rebuilt from silver on every run with `CREATE OR REPLACE TABLE ... AS SELECT`:
+- dimensions: `dim_date` (generated calendar), `dim_category`, and `dim_supplier` as a view over the silver SCD Type 2 table plus an unknown member with key `-1`
+- facts: `fact_po_line` (one row per PO line), `fact_receipt` (one row per receipt, with an `is_orphan` data quality flag) and `fact_invoice` (one row per invoice, with `is_maverick`)
+- marts: `mart_spend_monthly` (month, supplier, category, with a running total and share of month), `mart_supplier_performance` (on-time, in-full and OTIF percentages per supplier and month) and `mart_invoice_match` (three-way match per PO with a match status)
+
+Every gold table has a comment and a stated grain.
+
+### Decisions, why, and the alternative
+
+**1. State the grain of every table before building it.**
+- Why: the grain decides the `GROUP BY`, tells users what they can safely add up, and gives a simple check: a fact with one row per PO line must have exactly as many rows as silver has PO lines. More rows means a join duplicated something.
+
+**2. Facts store the surrogate key of the supplier version valid at the time of the event.**
+- Why: the fact joins to the dimension row whose window contains the event date: `valid_from` inclusive, `valid_to` exclusive, and an open end for the current version. So a PO from January keeps the payment terms that applied in January, even after the supplier moves to new terms. Start inclusive and end exclusive means a date on a boundary belongs to exactly one version.
+- Alternative: join on the business key to the current row only (SCD Type 1 behaviour). Simpler, but history is rewritten: last year's report would show this year's terms.
+
+**3. An unknown member instead of dropping rows.**
+- Why: facts whose supplier cannot be found, such as a supplier still in quarantine or an unknown ID like `SUP-9999`, get `supplier_sk = -1` through a left join and `coalesce`. With an inner join that spend would silently disappear from every report. With an unknown member it stays visible and can be chased up.
+
+**4. Aggregate each side to the target grain before joining (avoid fan-out).**
+- Why: a PO with three lines and two invoices joined directly gives six rows, and every amount is counted several times. In the three-way match I aggregate ordered, received and invoiced values to one row per PO first, then join them one to one. In OTIF I collapse receipts to one row per PO line before joining to the lines. And I always join on the most specific shared key: receipts join to lines on `po_line_id`, not `po_id`.
+
+**5. Flags in the SELECT, filters in the WHERE.**
+- Why: to calculate an on-time percentage you need the late lines as well as the on-time ones, so each line gets a true or false flag and the rate is `avg(cast(flag as int))`. `WHERE` is only for rows that must never count, such as cancelled POs in spend.
+
+**6. Full rebuild with `CREATE OR REPLACE TABLE`, not incremental.**
+- Why: the data is small, a full rebuild is always correct, and the replace is atomic, so readers see either the old or the new table, never half of one. It keeps the table's history for time travel.
+- Alternative: materialized views, which Databricks refreshes, incrementally where it can; or incremental MERGE driven by Change Data Feed (phase 8). Both scale better, at the cost of more moving parts.
+
+**7. `gold.dim_supplier` is a view over silver.**
+- Why: silver owns the SCD Type 2 logic. Gold only adds the unknown member, so there is one copy of the logic and nothing to keep in sync.
+
+**8. The three-way match tolerance is 1 percent.**
+- Why: real matching always allows a small tolerance for rounding and minor price differences. In a real team that number is a business rule agreed with procurement, not an engineering choice. The `CASE` checks the missing cases first (nothing received, nothing invoiced), because `CASE` returns the first branch that is true.
+
+### SQL points to be able to explain
+
+- Every dimension joins to the fact, never to another dimension: that is what makes it a star.
+- `SUM(x) OVER (PARTITION BY a ORDER BY month)` is a running total; without `ORDER BY` it is the partition total, which gives shares.
+- Averaging percentages across suppliers is wrong; weight them by the number of lines.
+- After a `LEFT JOIN`, a NULL key on the right-hand side means "no match", which is how "not received" and "not invoiced" are detected.
+
+### Quiz answers to say out loud
+
+**What is the grain, and how did you check it?**
+"`fact_po_line` has one row per purchase order line, and `mart_spend_monthly` has one row per month, supplier and category. I checked the fact by comparing its row count with `silver.po_lines`: they must be equal. More rows would mean a join duplicated lines, for example the supplier join matching two versions because their validity windows overlap. Fewer rows would mean an inner join dropped lines."
+
+**How do a January PO and a March PO find the right supplier version?**
+"The supplier has two versions: 30-day terms valid until 14 February, and 60-day terms from 14 February with no end date. The fact joins on the supplier ID and on the order date falling inside the version's window: on or after `valid_from`, and before `valid_to` or with no `valid_to` at all. The January PO only fits the first window, so it gets the 30-day version. The March PO only fits the second, open window, so it gets 60 days. The start is inclusive and the end exclusive because one version's end is exactly the next version's start, so a PO dated 14 February belongs to exactly one version, never to both and never to neither."
+
+**Why a left join and an unknown member instead of an inner join?**
+"Some facts have no matching supplier version: an unknown ID like `SUP-9999`, a supplier whose only record is still in quarantine, or a date before the supplier's first version. An inner join would drop those rows, so total spend in every report would be understated and nobody would know. With a left join and `coalesce(supplier_sk, -1)`, that spend appears under 'Unknown supplier', the totals stay complete, and the data quality problem is visible so someone can fix it."
+
+**Why aggregate to `po_id` before joining in the three-way match?**
+"Because the three sides have different grains. A PO with three lines and two invoices, joined directly, produces six rows. Summing the ordered amount over those rows counts it twice, and the invoiced amount three times, so a correctly invoiced PO would look badly over-invoiced. Aggregating ordered, received and invoiced to one row per PO first makes every join one to one, so each amount is counted once."
+
+**How do you calculate on-time percentage, and why not average the supplier percentages?**
+"Each received line gets a boolean flag, `last_received_date <= expected_delivery_date`, in the `SELECT`. The rate is `avg(cast(flag as int)) * 100`, because true becomes 1 and false 0, so the average of the ones and zeros is the share that were on time. It cannot be a `WHERE`, because filtering out the late lines would leave only on-time lines and every supplier would score 100 percent. Across all suppliers I would not average the per-supplier percentages, because a supplier with 2 lines would count as much as one with 200. The correct overall rate is total on-time lines divided by total lines, or the supplier percentages weighted by their line counts."

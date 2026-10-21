@@ -2,9 +2,9 @@
 
 ## Status (update at the end of every phase)
 
-- Current phase: **4 (Gold)** in progress: James writing F1, F2 (point-in-time joins) and M1 to M3 (marts) in `pipelines/gold/gold_build.sql`; Claude wrote the dims and fact_receipt. Phase 3 done (dim_supplier idempotency confirmed: 76 versions, 51 current, 51 suppliers after batch 5). Next: phase 5 (Tue 20).
+- Current phase: **5 (Declarative pipeline)** in progress: James writing expectations E1, E2 and AUTO CDC flows C1, C2 in `pipelines/declarative/procurement_pipeline.sql` (target schema `procurement.ldp`). Phase 4 done.
 - Catalog in use: `procurement` (CREATE CATALOG works on Free Edition)
-- Last session: Mon 19 Oct 2026. About 3 days behind the original schedule; revised plan below.
+- Last session: Wed 21 Oct 2026. Plan for the final two days below.
 
 ### Revised schedule (agreed Mon 19 Oct)
 
@@ -12,8 +12,9 @@
 |---|---|
 | Mon 19 (5h) | explore_silver, SCD2 dim_supplier, batch 5 test, phase 3 notes and quiz; phase 4 concepts if time |
 | Tue 20 | Phase 4 (star schema, point-in-time SCD2 join, 3 marts: spend, OTIF, three-way match; no dashboard), Phase 5 (declarative pipeline, expectations, AUTO CDC) |
-| Wed 21 | Phase 6 (one job, deliberate failure, repair run), Phase 7 light (GRANTs, comments, lineage; no row filters), Phase 8 talk-through (one CLUSTER BY + OPTIMIZE), Phase 9 (walkthrough script, mock interview) |
-| Thu 22 | Light review only |
+| Wed 21 | Phase 4 wrap-up (point-in-time proof, quiz), Phase 5 (declarative pipeline, expectations, AUTO CDC, quiz) |
+| Thu 22 | Phase 6 minimal (one job, deliberate failure, repair run), phases 7 and 8 as talk-through notes, 3-minute walkthrough script, mock interview |
+| Fri 23 | Interview |
 
 James prefers to write boilerplate too where time allows; switch back to Claude writing it if behind.
 
