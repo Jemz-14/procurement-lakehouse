@@ -246,3 +246,9 @@ display(spark.sql(f"""
 # spark.sql(f"TRUNCATE TABLE {catalog}.silver.dim_supplier")
 # spark.sql(f"DELETE FROM {catalog}.ops.quarantine WHERE entity = 'suppliers'")
 # dbutils.fs.rm(f"{checkpoint_root}/dim_supplier", True)
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC select *
+# MAGIC from procurement.silver.dim_supplier
