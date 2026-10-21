@@ -54,8 +54,8 @@ CREATE OR REFRESH STREAMING TABLE suppliers_clean (
   --   payment_terms_days is not null and >= 0; updated_at is not null.
   CONSTRAINT has_supplier_id EXPECT (supplier_id IS NOT NULL) ON VIOLATION DROP ROW,
   CONSTRAINT has_name EXPECT (name IS NOT NULL) ON VIOLATION DROP ROW,
-  CONSTRAINT valid_status EXPECT (status IS NOT NULL AND status is IN ('ACTIVE', 'INACTIVE', 'BLOCKED')) ON VIOLATION DROP ROW,
-  CONSTRAINT valid_payment_terms EXPECT (payment_terms_days IS NOT NULL OR payments_term days >= 0) ON VIOLATION DROP ROW,
+  CONSTRAINT valid_status EXPECT (status IS NOT NULL AND status IN ('ACTIVE', 'INACTIVE', 'BLOCKED')) ON VIOLATION DROP ROW,
+  CONSTRAINT valid_payment_terms EXPECT (payment_terms_days IS NOT NULL AND payment_terms_days >= 0) ON VIOLATION DROP ROW,
   CONSTRAINT has_updated_at EXPECT (updated_at IS NOT NULL) ON VIOLATION DROP ROW
 )
 COMMENT 'Typed and standardised suppliers; rows failing an expectation are dropped and counted'
