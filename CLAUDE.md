@@ -2,9 +2,9 @@
 
 ## Status (update at the end of every phase)
 
-- Current phase: **5 (Declarative pipeline)** in progress: James writing expectations E1, E2 and AUTO CDC flows C1, C2 in `pipelines/declarative/procurement_pipeline.sql` (target schema `procurement.ldp`). Phase 4 done.
+- Current phase: **6 (Jobs)** in progress: job `procurement_daily` (generate, bronze, two silver tasks in parallel, gold, quality gate in `quality/quality_checks.sql`), batch 6, deliberate failure and repair run. Phases 0 to 5 done.
 - Catalog in use: `procurement` (CREATE CATALOG works on Free Edition)
-- Last session: Wed 21 Oct 2026. Plan for the final two days below.
+- Last session: Thu 22 Oct 2026. Interview tomorrow.
 
 ### Revised schedule (agreed Mon 19 Oct)
 

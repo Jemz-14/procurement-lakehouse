@@ -357,3 +357,73 @@ Every gold table has a comment and a stated grain.
 
 **How do you calculate on-time percentage, and why not average the supplier percentages?**
 "Each received line gets a boolean flag, `last_received_date <= expected_delivery_date`, in the `SELECT`. The rate is `avg(cast(flag as int)) * 100`, because true becomes 1 and false 0, so the average of the ones and zeros is the share that were on time. It cannot be a `WHERE`, because filtering out the late lines would leave only on-time lines and every supplier would score 100 percent. Across all suppliers I would not average the per-supplier percentages, because a supplier with 2 lines would count as much as one with 200. The correct overall rate is total on-time lines divided by total lines, or the supplier percentages weighted by their line counts."
+
+---
+
+## Phase 5: Lakeflow Spark Declarative Pipelines (formerly Delta Live Tables)
+
+### What we built
+
+One declarative pipeline, `procurement_declarative`, written as a single SQL file and run on serverless, publishing to a separate schema `procurement.ldp` so it never touches the hand-written tables. For suppliers and invoices it does bronze to silver:
+- `bronze_suppliers` and `bronze_invoices`: streaming tables reading the landing volume with `STREAM read_files`, which is Auto Loader under the hood
+- `suppliers_clean` and `invoices_clean`: streaming tables that type and standardise the data, with expectations
+- `silver_dim_supplier`: SCD Type 2 maintained by `AUTO CDC ... STORED AS SCD TYPE 2`
+- `silver_invoices`: deduplicated by `AUTO CDC ... STORED AS SCD TYPE 1`
+- `mart_maverick_monthly`: a materialized view of maverick spend per month
+
+The pipeline worked out the dependency order itself from the `FROM` clauses and drew the graph.
+
+**Results, compared with the hand-written version on the same five batches:**
+- Supplier dimension: 76 versions, 51 current rows, 51 suppliers in both. Identical history.
+- Invoices: 863 in both. 924 rows passed the expectations, AUTO CDC removed 61 duplicate copies.
+- Invoice expectations: 38 rows dropped by the drop rules, 84 rows warned by `has_po` (the maverick invoices, kept and counted), and the fail rule on `invoice_id` was never triggered.
+
+### Expectations: the three actions
+
+- **Fail** (`ON VIOLATION FAIL UPDATE`) for a broken contract, such as an invoice with no ID: stop the update rather than load nonsense.
+- **Drop** (`ON VIOLATION DROP ROW`) for records that cannot be used, such as a negative or non-numeric amount: remove and count them, and keep the rest flowing.
+- **Warn** (no `ON VIOLATION` clause) for data that is valid but worth measuring, such as maverick invoices: keep them and count them. Dropping them would hide exactly the spend procurement wants to reduce.
+- An expectation describes a good row, so it is the mirror image of a reject rule: a reject rule says what is wrong and joins conditions with OR; an expectation says what is right and joins them with AND.
+
+### AUTO CDC (formerly APPLY CHANGES INTO)
+
+- `KEYS` is the business key, `SEQUENCE BY` says which record is newer, `STORED AS SCD TYPE 1` overwrites, `STORED AS SCD TYPE 2` keeps history in `__START_AT` and `__END_AT`.
+- `TRACK HISTORY ON * EXCEPT (_source_file, _batch, _ingested_at)` means a re-sent copy that differs only in technical columns does not create a new version.
+- Because it sequences records, AUTO CDC places late, out-of-order versions correctly in the history.
+
+### Hand-written versus declarative (the phase 5 exercise)
+
+| | Hand-written (phase 3) | Declarative (phase 5) |
+|---|---|---|
+| SCD Type 2 | a notebook of about 120 lines: dedup, filter to newer versions, `LEAD` for validity windows, staged MERGE with a NULL merge key | 6 lines of `AUTO CDC ... STORED AS SCD TYPE 2` |
+| Deduplicate and upsert | `QUALIFY ROW_NUMBER` plus MERGE with an `updated_at` guard | `AUTO CDC ... STORED AS SCD TYPE 1` |
+| Checkpoints | managed by me in a volume; table and checkpoint must be reset together | managed by the pipeline |
+| Idempotency | engineered by me: MERGE on keys, insert-only quarantine keyed by a hash | built in |
+| Order of steps | I decide it, and the job in phase 6 encodes it | inferred from the queries, shown as a graph |
+| Late, out-of-order versions | ignored (only versions newer than the current one are accepted) | placed correctly by `SEQUENCE BY` |
+| Re-sent copies with no real change | would create a new version without an attribute hash | prevented by `TRACK HISTORY ON ... EXCEPT` |
+| Bad rows | stored in `ops.quarantine` with every failed rule and the raw record | dropped rows are only counted, unless I build a separate quarantine table |
+| Data quality metrics | my own queries on quarantine and history | per expectation in the UI and the event log |
+| Surrogate key | identity column `supplier_sk` | none; versions are identified by key and `__START_AT`, gold would add a key |
+| Control | anything is possible: custom MERGE logic, first-copy-wins, several targets | limited to what the framework supports |
+
+**When I would use each.** For standard medallion ingestion, deduplication and CDC, I would use declarative pipelines: much less code to maintain, built-in data quality metrics and lineage, and correct handling of out-of-order data, which is easy to get wrong by hand. I would write it by hand when the logic does not fit the framework, for example a custom merge rule, or when I need the rejected rows themselves kept with reasons for a remediation workflow, not just counted. Having built both, I understand what AUTO CDC is doing underneath, which helps when debugging it.
+
+**Honest limits.** On Free Edition only one pipeline can be active at a time, and I built the declarative version for suppliers and invoices only, not purchase orders and receipts.
+
+### Quiz answers to say out loud
+
+**What is the difference between the hand-written and the declarative pipeline?**
+"In the hand-written version I wrote how the data moves: the streaming read, the checkpoint locations, `foreachBatch`, the temp views, the deduplication, every MERGE, and the logic that makes replays safe. In the declarative version I only declare what each table should contain, as a query, and the framework handles the rest: it works out the dependency order from the queries, manages checkpoints and retries, makes the processing incremental and idempotent, and records data quality metrics and lineage in the event log. AUTO CDC replaced my deduplication and MERGE logic, including the whole SCD Type 2 notebook, and produced exactly the same result: 76 supplier versions, 51 current, and 863 invoices in both versions. The main thing I gave up is the quarantine: my hand-written version stores every rejected row with its reasons, while the declarative one only counts dropped rows unless I build a separate table for them."
+
+**What do the three expectation actions do, and why is maverick spend a warning?**
+"An expectation states what a valid row looks like. Fail stops the update: I used it for a missing invoice ID, because that is a broken contract and loading it would be worse than stopping. Drop removes the row and counts it: I used it for rows I cannot use, such as a missing supplier or date, a missing or negative amount, and a due date before the invoice date. Warn keeps the row and only counts it: I used it for invoices without a PO. Maverick spend is valid data that procurement wants to measure and reduce, so dropping it would hide exactly what the business needs to see. On my run, 38 rows were dropped, 84 maverick invoices were kept and counted, and the fail rule was never triggered."
+
+**Explain `KEYS`, `SEQUENCE BY` and `TRACK HISTORY`, and what AUTO CDC handles that your version does not.**
+"`KEYS` is the business key that identifies the same supplier across all its records, here `supplier_id`. `SEQUENCE BY` is the column that decides which record is newer, here `updated_at`, so records do not have to arrive in order. `STORED AS SCD TYPE 2` is what makes it keep history. `TRACK HISTORY ON * EXCEPT` the three technical columns controls which column changes create a new version: a re-sent copy that differs only in its source file or ingestion time is not a real change, so it must not create a new version. Without it, every duplicate delivery would add a false version to the history. The case AUTO CDC handles that mine does not is out-of-order data: if an older version arrives late, AUTO CDC uses the sequence to place it correctly in the history, whereas my hand-written version only accepts versions newer than the current one and ignores the rest."
+
+**What is the difference between a streaming table and a materialized view?**
+"Both are tables you can query. A streaming table processes each new input row once, incrementally, and keeps what it has processed, which suits ingestion and append-style data: `bronze_invoices` only ever needs to pick up new files. A materialized view stores the result of a query and the pipeline keeps it up to date when its sources change, recomputing it or refreshing it incrementally where possible. That suits aggregations and joins, where a new row can change a result that already exists: when a new invoice arrives, a month's total in `mart_maverick_monthly` has to change, which a streaming table would not do."
+
+**Would you migrate existing hand-written MERGE pipelines to declarative pipelines?**
+"Not just for the sake of it: a working, well-tested pipeline has value, and a migration has cost and risk. For new pipelines that follow the standard pattern, ingestion, cleaning, deduplication and CDC, I would choose declarative pipelines, because there is far less code to maintain, data quality metrics and lineage come built in, and out-of-order data is handled correctly. I would migrate an existing pipeline when it becomes hard to maintain or keeps breaking. I would keep hand-written code when the logic does not fit the framework, for example a custom merge rule, or when the team needs the rejected rows themselves stored for a remediation workflow rather than just counted."
