@@ -52,7 +52,11 @@ CREATE OR REFRESH STREAMING TABLE suppliers_clean (
   -- separated by commas. Careful: EXPECT states what a GOOD row looks like (the opposite of a reject rule).
   --   supplier_id is not null; name is not null; status is one of ACTIVE, INACTIVE, BLOCKED;
   --   payment_terms_days is not null and >= 0; updated_at is not null.
-
+  CONSTRAINT has_supplier_id EXPECT (supplier_id IS NOT NULL) ON VIOLATION DROP ROW,
+  CONSTRAINT has_name EXPECT (name IS NOT NULL) ON VIOLATION DROP ROW,
+  CONSTRAINT valid_status EXPECT (status IS NOT NULL AND status IN ('ACTIVE', 'INACTIVE', 'BLOCKED')) ON VIOLATION DROP ROW,
+  CONSTRAINT valid_payment_terms EXPECT (payment_terms_days IS NOT NULL AND payment_terms_days >= 0) ON VIOLATION DROP ROW,
+  CONSTRAINT has_updated_at EXPECT (updated_at IS NOT NULL) ON VIOLATION DROP ROW
 )
 COMMENT 'Typed and standardised suppliers; rows failing an expectation are dropped and counted'
 AS SELECT
@@ -82,6 +86,13 @@ COMMENT 'Supplier dimension, SCD Type 2, maintained by AUTO CDC (__START_AT / __
 --   Why TRACK HISTORY: a re-sent copy differs only in _source_file / _ingested_at / _batch, and those
 --   changes must not create a new version. This is the "attribute hash" gap in the hand-written version.
 
+CREATE FLOW dim_supplier_cdc AS AUTO CDC INTO silver_dim_supplier
+FROM STREAM(suppliers_clean)
+  KEYS (supplier_id)
+  SEQUENCE BY updated_at
+  STORED AS SCD TYPE 2
+  TRACK HISTORY ON * EXCEPT (_source_file, _batch, _ingested_at);
+
 
 
 -- ---------------------------------------------------------------------------
@@ -95,6 +106,14 @@ CREATE OR REFRESH STREAMING TABLE invoices_clean (
   --                amount >= 0; due_date is not null; due_date >= invoice_date
   --   warn (no ON VIOLATION clause): po_id is not null
   --                (maverick invoices are valid data, we only want them counted)
+  CONSTRAINT has_invoice_id     EXPECT (invoice_id IS NOT NULL) ON VIOLATION FAIL UPDATE,
+  CONSTRAINT has_supplier_id    EXPECT (supplier_id IS NOT NULL) ON VIOLATION DROP ROW,
+  CONSTRAINT valid_invoice_date EXPECT (invoice_date IS NOT NULL) ON VIOLATION DROP ROW,
+  CONSTRAINT valid_amount       EXPECT (amount IS NOT NULL AND amount >= 0) ON VIOLATION DROP ROW,
+  CONSTRAINT valid_due_date     EXPECT (due_date IS NOT NULL AND due_date >= invoice_date) ON VIOLATION DROP ROW,
+  CONSTRAINT has_po             EXPECT (po_id IS NOT NULL)
+
+
 
 )
 COMMENT 'Typed invoices; bad rows dropped and counted, maverick invoices kept and counted'
@@ -119,7 +138,11 @@ COMMENT 'One row per invoice, deduplicated by AUTO CDC (SCD Type 1)';
 --   Same shape as C1, but: KEYS (invoice_id), SEQUENCE BY _ingested_at, STORED AS SCD TYPE 1,
 --   and no TRACK HISTORY (type 1 keeps no history). This one statement replaces TODO 7 and 8
 --   of silver_transactions (dedup + MERGE).
-
+CREATE FLOW invoices_cdc AS AUTO CDC INTO silver_invoices
+FROM STREAM(invoices_clean)
+KEYS (invoice_id)
+SEQUENCE BY _ingested_at
+STORED AS SCD TYPE 1;
 
 
 -- ---------------------------------------------------------------------------
